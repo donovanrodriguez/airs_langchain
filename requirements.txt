@@ -1,0 +1,12 @@
+# Dependencies for AIRSGuardedChatModel + the demo in test_app.py.
+#
+# pan-aisecurity has shipped breaking changes between minor versions
+# (per CLAUDE.md). After your first successful install, freeze with:
+#   pip freeze | grep -iE '^(pan-aisecurity|langchain|pydantic|python-dotenv)='
+# and replace the entries below with == pins for reproducibility.
+
+pan-aisecurity
+langchain-core>=0.3
+langchain-anthropic>=0.3
+pydantic>=2.0
+python-dotenv>=1.0
