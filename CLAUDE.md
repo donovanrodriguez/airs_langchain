@@ -163,6 +163,16 @@ Tool calls are scanned in two places, with different semantics:
   both `content` and stringified `tool_calls` to the flattened prompt.
   This catches tool-arg injection in histories assembled outside this
   wrapper (the wrapper's response-side scan only sees what *it* generates).
+  The flatten is **conditional**: if no message in history has any
+  `tool_calls`, role prefixes (`"human:"`, `"ai:"`, ...) and the
+  tool_calls stringification are dropped, and the scan sees raw
+  `content` joined by newlines. Reason: role-prefixed multi-turn output
+  reads as an agent transcript and trips AIRS's server-side `agent`
+  detector on ordinary conversations, producing `agent: true` false
+  positives. Role labels weren't doing security work — they were
+  structural metadata. As soon as any tool_call appears in history, the
+  scan switches back to the full role-prefixed form so historical tool
+  args still get scanned.
 
 Tool-argument injection is a real attack vector. The two-scan response
 design exists specifically because joining content + tool_calls into a
@@ -206,9 +216,20 @@ except PrismaAIRSBlocked as e:
 
 ## Configuration
 
-Required environment:
-- `PANW_AI_SEC_API_KEY` (or `PANW_AI_SEC_API_TOKEN`) — set before
-  `aisecurity.init()` runs
+AIRS credentials and endpoint resolve in this order (highest → lowest):
+
+1. **Explicit constructor arg** (`api_key=`, `api_token=`, `api_endpoint=`)
+2. **`.env` file** — only loaded when `load_dotenv=True` or `dotenv_path=...`
+   is passed to the constructor. `python-dotenv` loads with `override=False`,
+   so process env still wins for vars that are already set.
+3. **Process env vars** — `PANW_AI_SEC_API_KEY`, `PANW_AI_SEC_API_TOKEN`,
+   `PANW_AI_SEC_API_ENDPOINT`.
+4. **SDK default** — `aisecurity.init()` reads env itself when its kwargs
+   are `None`. We pass `None` through as "omit" rather than overriding.
+
+Empty strings (`""`) are treated as unset at every level — keeps a blank
+ctor arg or shell var from shadowing a real one and from causing opaque
+SDK auth failures.
 
 Constructor:
 - `inner_llm: BaseChatModel` — required
@@ -218,6 +239,15 @@ Constructor:
   on `direction="response"` scans. When unset, response scans reuse the
   base profile. Set these when the response side needs a stricter (or
   looser) profile than the prompt side. Same id-wins-over-name rule.
+- `api_key`, `api_token`, `api_endpoint` — optional explicit AIRS
+  credentials. Override env/.env when set.
+- `load_dotenv: bool = False` — opt-in flag to auto-discover a `.env` in
+  CWD/parents before resolving credentials. Default is off so importing
+  this module never reads the filesystem unexpectedly in library/service
+  contexts.
+- `dotenv_path: Optional[str] = None` — explicit `.env` path. Setting this
+  implies loading even if `load_dotenv` is `False`. Raises `ImportError`
+  if `python-dotenv` isn't installed.
 - `app_user`, `app_name` — surfaced in AIRS console metadata for forensics
 - `fail_closed: bool = True` — see above
 
@@ -235,6 +265,37 @@ guarded = AIRSGuardedChatModel(
 # Drop into anything that takes a chat model
 chain = prompt | guarded | parser
 result = chain.invoke({"input": "..."})
+```
+
+Credential-source variants:
+
+```python
+# 1. Auto-load .env (notebooks, local dev)
+guarded = AIRSGuardedChatModel(
+    inner_llm=ChatOpenAI(model="gpt-4o-mini"),
+    profile_name="prod-profile",
+    load_dotenv=True,
+)
+
+# 2. Explicit .env path
+guarded = AIRSGuardedChatModel(
+    inner_llm=ChatOpenAI(model="gpt-4o-mini"),
+    profile_name="prod-profile",
+    dotenv_path="/etc/myapp/airs.env",
+)
+
+# 3. Inject credentials directly (tests, secret-manager integrations)
+guarded = AIRSGuardedChatModel(
+    inner_llm=ChatOpenAI(model="gpt-4o-mini"),
+    profile_name="prod-profile",
+    api_key=secrets_client.get("airs/api_key"),
+)
+
+# 4. Pure process env (12-factor; nothing extra to pass)
+guarded = AIRSGuardedChatModel(
+    inner_llm=ChatOpenAI(model="gpt-4o-mini"),
+    profile_name="prod-profile",
+)
 ```
 
 ## Open items / future work

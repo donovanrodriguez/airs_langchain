@@ -1,4 +1,5 @@
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Iterator, List, Optional
 
@@ -7,6 +8,11 @@ from aisecurity.scan.inline.scanner import Scanner
 from aisecurity.generated_openapi_client.models.ai_profile import AiProfile
 from aisecurity.scan.models.content import Content
 from aisecurity.exceptions import AISecSDKException
+
+try:
+    from dotenv import load_dotenv as _load_dotenv
+except ImportError:  # python-dotenv is optional at runtime
+    _load_dotenv = None
 
 from pydantic import PrivateAttr
 
@@ -22,6 +28,14 @@ logger = logging.getLogger(__name__)
 # The AIRS sync scan API caps request bodies at 2MB. We chunk at 1.5MB to
 # leave headroom for JSON envelope, metadata, and profile fields.
 AIRS_SYNC_CHUNK_BYTES = 1_500_000
+
+
+def _first_nonempty(*values: Optional[str]) -> Optional[str]:
+    """Return the first value that is not None and not an empty/whitespace string."""
+    for v in values:
+        if v is not None and v.strip() != "":
+            return v
+    return None
 
 
 class PrismaAIRSBlocked(Exception):
@@ -94,6 +108,22 @@ class AIRSGuardedChatModel(BaseChatModel):
     app_name: str = "langchain-app"
     fail_closed: bool = True  # if AIRS errors, block (True) or pass through (False)
 
+    # AIRS SDK credentials and endpoint. Resolution order (highest -> lowest):
+    #   1. Explicit ctor arg here.
+    #   2. .env file (only when load_dotenv=True or dotenv_path is set; loaded
+    #      with override=False so process env still wins for already-set vars).
+    #   3. Process env vars (PANW_AI_SEC_API_KEY / _API_TOKEN / _API_ENDPOINT).
+    #   4. SDK default (aisecurity.init() reads env itself when args are None).
+    api_key: Optional[str] = None
+    api_token: Optional[str] = None
+    api_endpoint: Optional[str] = None
+    # .env support. Defaults to off so importing this module never reads the
+    # filesystem unexpectedly in library/service contexts. Set load_dotenv=True
+    # to auto-discover a .env in CWD/parents, or pass dotenv_path for an
+    # explicit file. dotenv_path implies loading even if load_dotenv is False.
+    load_dotenv: bool = False
+    dotenv_path: Optional[str] = None
+
     # Set in __init__; PrivateAttr keeps Pydantic from treating these as fields.
     _scanner: Optional[Scanner] = PrivateAttr(default=None)
     _ai_profile: Optional[AiProfile] = PrivateAttr(default=None)
@@ -107,8 +137,41 @@ class AIRSGuardedChatModel(BaseChatModel):
                 "AIRSGuardedChatModel requires either profile_name or profile_id"
             )
 
+        # Optionally load a .env before resolving credentials. override=False so
+        # explicit process env vars beat .env values (12-factor friendly).
+        if self.load_dotenv or self.dotenv_path:
+            if _load_dotenv is None:
+                raise ImportError(
+                    "python-dotenv is required when load_dotenv=True or "
+                    "dotenv_path is set. Install with: pip install python-dotenv"
+                )
+            _load_dotenv(self.dotenv_path, override=False)
+
+        # Resolve effective credentials. Empty strings are treated as unset so a
+        # blank ctor arg or shell var doesn't shadow a real one (and so the SDK
+        # doesn't fail opaquely on auth).
+        effective_key = _first_nonempty(
+            self.api_key, os.environ.get("PANW_AI_SEC_API_KEY")
+        )
+        effective_token = _first_nonempty(
+            self.api_token, os.environ.get("PANW_AI_SEC_API_TOKEN")
+        )
+        effective_endpoint = _first_nonempty(
+            self.api_endpoint, os.environ.get("PANW_AI_SEC_API_ENDPOINT")
+        )
+
+        # Pass only the args we actually resolved. Anything left as None lets
+        # aisecurity.init() fall through to its own env-read defaults.
+        init_kwargs: dict = {}
+        if effective_key is not None:
+            init_kwargs["api_key"] = effective_key
+        if effective_token is not None:
+            init_kwargs["api_token"] = effective_token
+        if effective_endpoint is not None:
+            init_kwargs["api_endpoint"] = effective_endpoint
+
         # Safe to call repeatedly; intended once at app startup.
-        aisecurity.init()
+        aisecurity.init(**init_kwargs)
         self._scanner = Scanner()
         self._ai_profile = (
             AiProfile(profile_id=self.profile_id)
@@ -155,12 +218,28 @@ class AIRSGuardedChatModel(BaseChatModel):
         """Flatten a LangChain message list into a single string for scanning.
 
         Scans the entire history each turn so injection attempts buried in
-        earlier turns are caught. Tool calls in prior AIMessages are
-        stringified alongside content — tool-arg injection is a real attack
-        vector, and a history assembled outside this wrapper wouldn't have
-        had them scanned at generation time. Multimodal content
-        (list-of-dicts) will stringify via repr; special-case if needed.
+        earlier turns are caught. Two flatten modes:
+
+        * Plain chat (no tool_calls anywhere in history): join raw `content`
+          without role prefixes. Role-prefixed multi-turn output looks like
+          an agent transcript and trips AIRS's Agent detector on ordinary
+          conversations. Role labels weren't doing security work — they
+          were structural metadata. Drop them on this path.
+        * Tool-call history present: keep `role: content` prefixes and
+          stringify each message's `tool_calls`. Tool-arg injection is a
+          real attack vector, and a history assembled outside this wrapper
+          wouldn't have had its tool_calls scanned at generation time.
+
+        Multimodal content (list-of-dicts) stringifies via repr; special-case
+        if needed.
         """
+        has_tool_calls = any(
+            getattr(m, "tool_calls", None) for m in messages
+        )
+        if not has_tool_calls:
+            return "\n".join(
+                str(m.content) for m in messages if m.content
+            )
         parts: List[str] = []
         for m in messages:
             parts.append(f"{m.type}: {m.content}")

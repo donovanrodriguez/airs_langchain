@@ -1,8 +1,14 @@
 """Demo for AIRSGuardedChatModel.
 
-Exercises the wrapper end-to-end across four scenarios: happy path,
-prompt-injection block, DLP-shaped content (mask or block depending on
-profile config), and tool-call scanning (mask_as_block on tool args).
+Exercises the wrapper end-to-end across six scenarios:
+
+1. happy path
+2. prompt-injection block
+3. DLP-shaped content (mask or block depending on profile config)
+4. tool-call scanning with sensitive args (mask_as_block on tool args)
+5. pre-built history with tool_calls (forces role-prefixed flatten path)
+6. benign tool call (exercises the response-side tool_calls scan)
+
 Each section is independent — a block in one section does not stop later
 sections.
 
@@ -20,6 +26,7 @@ import os
 
 from dotenv import load_dotenv
 from langchain_anthropic import ChatAnthropic
+from langchain_core.messages import AIMessage, HumanMessage, ToolMessage
 from langchain_core.tools import tool
 
 from airs_langchain import AIRSGuardedChatModel, PrismaAIRSBlocked
@@ -121,6 +128,93 @@ def section_tool_calls(guarded: AIRSGuardedChatModel) -> None:
             )
 
 
+def section_history_with_tool_calls(guarded: AIRSGuardedChatModel) -> None:
+    """Exercise the role-prefixed flatten path.
+
+    Builds a multi-turn history that already contains an AIMessage with
+    `tool_calls` plus the matching ToolMessage. With any tool_calls in
+    history, `_messages_to_text` switches from the plain-chat path
+    (raw content joined) to the role-prefixed path (`role: content`
+    plus stringified tool_calls). This section verifies that branch
+    runs end-to-end without false-positive blocks.
+    """
+    print("\n=== Section 5: history with pre-existing tool_calls (role-prefixed flatten) ===")
+
+    @tool
+    def get_weather(city: str) -> str:
+        """Return current weather for a city."""
+        return f"Weather in {city}: 72F, clear."
+
+    tooled = guarded.bind_tools([get_weather])
+
+    history = [
+        HumanMessage(content="What's the weather in Paris?"),
+        AIMessage(
+            content="",
+            tool_calls=[
+                {
+                    "name": "get_weather",
+                    "args": {"city": "Paris"},
+                    "id": "call_paris_1",
+                    "type": "tool_call",
+                }
+            ],
+        ),
+        ToolMessage(
+            content="Weather in Paris: 72F, clear.",
+            tool_call_id="call_paris_1",
+        ),
+        HumanMessage(content="Thanks! Now in one sentence, summarize that for me."),
+    ]
+    try:
+        result = tooled.invoke(history)
+        print(f"  response: {result.content[:300]}")
+        print("  (role-prefixed flatten ran without an agent-detector false positive)")
+    except PrismaAIRSBlocked as e:
+        log_block("§5", e)
+        if e.direction == "prompt" and e.detected and getattr(e.detected, "agent", False):
+            print(
+                "  (AIRS flagged the role-prefixed history as agent traffic — "
+                "profile-level Agent detection is tuned aggressively)"
+            )
+
+
+def section_benign_tool_call(guarded: AIRSGuardedChatModel) -> None:
+    """Exercise the response-side tool_calls scan on benign args.
+
+    §4 masks the SSN before the LLM can call the tool, so the
+    response-side `tool_calls` scan never runs. Here the args are
+    benign, so the LLM actually emits tool_calls and the wrapper's
+    `_scan_text(str(tool_calls), mask_as_block=True)` path fires. A
+    block here would indicate either a real DLP hit on the args or a
+    false positive from the agent detector on the stringified call.
+    """
+    print("\n=== Section 6: benign tool call (exercises response-side tool_calls scan) ===")
+
+    @tool
+    def get_weather(city: str) -> str:
+        """Return current weather for a city."""
+        return f"Weather in {city}: 72F, clear."
+
+    tooled = guarded.bind_tools([get_weather])
+    try:
+        result = tooled.invoke("What's the weather in Tokyo?")
+        tool_calls = getattr(result, "tool_calls", None) or []
+        if tool_calls:
+            print(f"  tool_calls emitted (response-side scan + mask_as_block passed):")
+            for tc in tool_calls:
+                print(f"    {tc}")
+        else:
+            print(f"  No tool calls emitted. response: {result.content[:200]}")
+    except PrismaAIRSBlocked as e:
+        log_block("§6", e)
+        if e.direction == "response":
+            print(
+                "  (mask_as_block fired on tool_calls — either DLP flagged the "
+                "args or the agent detector hit on the stringified call)"
+            )
+
+
 def main() -> None:
     load_dotenv()
 
@@ -146,6 +240,8 @@ def main() -> None:
     section_prompt_injection(guarded)
     section_dlp(guarded)
     section_tool_calls(guarded)
+    section_history_with_tool_calls(guarded)
+    section_benign_tool_call(guarded)
 
     print("\nDone.")
     print(
